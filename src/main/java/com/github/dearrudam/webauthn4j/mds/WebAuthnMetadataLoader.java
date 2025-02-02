@@ -23,6 +23,7 @@ import java.net.http.HttpRequest.BodyPublishers;
 import java.net.http.HttpResponse;
 import java.security.cert.TrustAnchor;
 import java.security.cert.X509Certificate;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 
@@ -40,13 +41,7 @@ public class WebAuthnMetadataLoader {
 
         ObjectConverter objectConverter = new ObjectConverter();
 
-        MetadataBLOBFactory metadataBLOBFactory = new MetadataBLOBFactory(objectConverter);
-
-        MetadataBLOB parsed = metadataBLOBFactory.parse(readStringFromURL("https://mds3.fidoalliance.org/"));
-
-        MetadataBLOBBasedTrustAnchorRepository repository = // metadataBLOBBasedTrustAnchorRepository(objectConverter, "http://localhost:8080/webauthn");
-
-                new MetadataBLOBBasedTrustAnchorRepository(() -> parsed);
+        MetadataBLOBBasedTrustAnchorRepository repository = getMetadataBLOBBasedTrustAnchorRepository(objectConverter);
 
         AAGUID aaguid = new AAGUID("b93fd961-f2e6-462f-b122-82002247de78");
 
@@ -57,39 +52,26 @@ public class WebAuthnMetadataLoader {
 
     }
 
-    static record Endpoints(String status, List<String> result) {
-        @JsonCreator
-        Endpoints(@JsonProperty("status") String status, @JsonProperty("result") List<String> result) {
-            this.status = status;
-            this.result = result;
-        }
-    }
+    public static MetadataBLOBBasedTrustAnchorRepository getMetadataBLOBBasedTrustAnchorRepository(ObjectConverter objectConverter) {
+        MetadataBLOBFactory metadataBLOBFactory = new MetadataBLOBFactory(objectConverter);
 
-    static MetadataBLOBBasedTrustAnchorRepository metadataBLOBBasedTrustAnchorRepository(ObjectConverter objectConverter, String endpoint) {
+        MetadataBLOB metadataBLOB = metadataBLOBFactory.parse(readStringFromURL("https://mds3.fidoalliance.org/"));
 
-        X509Certificate mds3TestRootCertificate = loadCertificateFromURL("https://mds3.fido.tools/pki/MDS3ROOT.crt");
+        MetadataBLOBBasedTrustAnchorRepository repository = new MetadataBLOBBasedTrustAnchorRepository(() -> metadataBLOB);
 
-        Endpoints endpoints = loadEndpoints(endpoint);
-
-        MetadataBLOBProvider[] fidoMDS3MetadataBLOBProviders = endpoints
-                .result()
-                .stream()
-                .parallel()
-                .<MetadataBLOBProvider>mapMulti((url, downstream) -> {
-                    try {
-                        FidoMDS3MetadataBLOBProvider fidoMDS3MetadataBLOBProvider = new FidoMDS3MetadataBLOBProvider(objectConverter, url, mds3TestRootCertificate);
-                        fidoMDS3MetadataBLOBProvider.setRevocationCheckEnabled(true);
-                        fidoMDS3MetadataBLOBProvider.provide();
-                        downstream.accept(fidoMDS3MetadataBLOBProvider);
-                    } catch (RuntimeException e) {
-                        logger.warn("Failed to provide metadataBLOB from %s".formatted(url), e);
-                    }
-                })
-                .toArray(MetadataBLOBProvider[]::new);
-        return new MetadataBLOBBasedTrustAnchorRepository(fidoMDS3MetadataBLOBProviders);
+        return repository;
     }
 
     private static String readStringFromURL(String url) {
+        return readStringFromURL(new LinkedHashSet<>(),url);
+    }
+
+    private static String readStringFromURL(Set<String> accessedUrls, String url) {
+        if (!accessedUrls.add(url)) {
+            // redirect loop detected
+            throw new RuntimeException("Redirect loop detected: %s".formatted(accessedUrls));
+        }
+
         try {
 
             var request = HttpRequest.newBuilder()
@@ -100,15 +82,18 @@ public class WebAuthnMetadataLoader {
             var response = HttpClient.newHttpClient()
                     .send(request, HttpResponse.BodyHandlers.ofString());
 
-            logger.info("Response from %s : %s".formatted(url, response));
+            logger.info("Response from {} : {}", url, response);
 
             if (response.statusCode() >= 300 && response.statusCode() < 400) {
+                // should follow the redirect
                 String location = response.headers().firstValue("location").orElseThrow(
-                        () -> new RuntimeException("Cannot found the location HTTP header to redirect from URL: %s".
-                                formatted(url)));
-                logger.info("Redirecting from %s to %s".formatted(url, location));
-                return readStringFromURL(location);
+                        () -> new RuntimeException(
+                                "Cannot found the location HTTP header to redirect from URL: %s".formatted(url)));
+
+                logger.info("Redirecting from {} to {}", url, location);
+                return readStringFromURL(accessedUrls, location);
             }
+
             if (response.statusCode() != 200) {
                 throw new RuntimeException("Failed to load data from %s : Status Code: %s . Response: %s".formatted(url, response.statusCode(), response.body()));
             }
@@ -159,6 +144,38 @@ public class WebAuthnMetadataLoader {
         } catch (InterruptedException e) {
             throw new RuntimeException(e);
         }
+    }
+
+    static record Endpoints(String status, List<String> result) {
+        @JsonCreator
+        Endpoints(@JsonProperty("status") String status, @JsonProperty("result") List<String> result) {
+            this.status = status;
+            this.result = result;
+        }
+    }
+
+    static MetadataBLOBBasedTrustAnchorRepository metadataBLOBBasedTrustAnchorRepository(ObjectConverter objectConverter, String endpoint) {
+
+        X509Certificate mds3TestRootCertificate = loadCertificateFromURL("https://mds3.fido.tools/pki/MDS3ROOT.crt");
+
+        Endpoints endpoints = loadEndpoints(endpoint);
+
+        MetadataBLOBProvider[] fidoMDS3MetadataBLOBProviders = endpoints
+                .result()
+                .stream()
+                .parallel()
+                .<MetadataBLOBProvider>mapMulti((url, downstream) -> {
+                    try {
+                        FidoMDS3MetadataBLOBProvider fidoMDS3MetadataBLOBProvider = new FidoMDS3MetadataBLOBProvider(objectConverter, url, mds3TestRootCertificate);
+                        fidoMDS3MetadataBLOBProvider.setRevocationCheckEnabled(true);
+                        fidoMDS3MetadataBLOBProvider.provide();
+                        downstream.accept(fidoMDS3MetadataBLOBProvider);
+                    } catch (RuntimeException e) {
+                        logger.warn("Failed to provide metadataBLOB from %s".formatted(url), e);
+                    }
+                })
+                .toArray(MetadataBLOBProvider[]::new);
+        return new MetadataBLOBBasedTrustAnchorRepository(fidoMDS3MetadataBLOBProviders);
     }
 
 }
